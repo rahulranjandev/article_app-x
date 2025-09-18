@@ -4,8 +4,8 @@
     <h1 class="mb-4">Edit Article</h1>
     {% from "includes/_formhelpers.html" import render_field %}
     <form method="POST" action="">
-      {{ render_field(form.title, class_="form-control") }}
-      {{ render_field(form.body, class_="form-control", id="editor", rows="10") }}
+      {{ render_field(form.title, class_="form-control") }} {{ render_field(form.body, class_="form-control",
+      id="editor", rows="10") }}
       <button type="submit" class="btn btn-primary">Submit</button>
     </form>
   </div>
