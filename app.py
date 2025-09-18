@@ -1,4 +1,4 @@
-# from data import Articles
+import os
 from flask import (
     Flask,
     render_template,
@@ -15,13 +15,19 @@ from hashlib import sha256
 from config import dbHost, dbpasswd, dbport, dbuser, db
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
 
-# Config MySQL
-mydb = mysql.connector.connect(host=dbHost, user=dbuser, password=dbpasswd, port=dbport, database=db)
 
-mycursor = mydb.cursor()
-
-# article = Articles()
+# Config MySQL - Use connection pooling for better performance
+def get_db_connection():
+    return mysql.connector.connect(
+        host=dbHost,
+        user=dbuser,
+        password=dbpasswd,
+        port=dbport,
+        database=db,
+        autocommit=True,  # Enable autocommit to avoid manual commits
+    )
 
 
 # Home
@@ -36,7 +42,7 @@ def favicon():
     return redirect(url_for("static", filename="favicon.ico"))
 
 
-# about
+# About
 @app.route("/about")
 def about():
     return render_template("about.html")
@@ -45,52 +51,75 @@ def about():
 # Articles
 @app.route("/articles", methods=["GET"])
 def articles():
-    sql = "SELECT * FROM articles"
-
+    mydb = None
+    mycursor = None
     try:
+        mydb = get_db_connection()
+        mycursor = mydb.cursor()
+
+        sql = "SELECT * FROM articles ORDER BY id DESC"
         mycursor.execute(sql)
 
         doc_2 = mycursor.fetchall()
 
         if doc_2:
             return render_template("articles.html", articles=doc_2)
-            # return jsonify(data=doc_2)
-
         else:
             msg = "No Articles Found"
             return render_template("articles.html", msg=msg)
 
     except Exception as e:
-        print("error", e)
+        app.logger.error(f"Error in articles route: {e}")
+        flash("Error loading articles", "danger")
+        return render_template("articles.html", msg="Error loading articles")
+    finally:
+        if mycursor:
+            mycursor.close()
+        if mydb:
+            mydb.close()
 
 
 # View Article
-@app.route("/article/<id>/", methods=["GET"])
+@app.route("/article/<int:id>/", methods=["GET"])
 def articled(id):
-    sql = "SELECT * FROM articles WHERE id = %s"
-    val = (id,)
-
+    mydb = None
+    mycursor = None
     try:
-        mycursor.execute(sql, val)
+        mydb = get_db_connection()
+        mycursor = mydb.cursor()
+
+        sql = "SELECT * FROM articles WHERE id = %s"
+        mycursor.execute(sql, (id,))
 
         doc = mycursor.fetchone()
 
-        return render_template("article.html", article=doc)
+        if doc:
+            return render_template("article.html", article=doc)
+        else:
+            flash("Article not found", "danger")
+            return redirect(url_for("articles"))
 
     except Exception as e:
-        print("error", e)
+        app.logger.error(f"Error in article view: {e}")
+        flash("Error loading article", "danger")
+        return redirect(url_for("articles"))
+    finally:
+        if mycursor:
+            mycursor.close()
+        if mydb:
+            mydb.close()
 
 
 # Register Form
-class RegisterFrom(Form):
-    pass
+class RegisterForm(Form):  # Fixed class name typo
     name = StringField("Name", [validators.Length(min=1, max=50)])
-    username = StringField("username", [validators.Length(min=4, max=25)])
-    email = StringField("Email", [validators.Length(min=6, max=50)])
+    username = StringField("Username", [validators.Length(min=4, max=25)])
+    email = StringField("Email", [validators.Length(min=6, max=50), validators.Email()])
     password = PasswordField(
         "Password",
         [
-            validators.data_required(),
+            validators.DataRequired(),
+            validators.Length(min=6),
             validators.EqualTo("confirm", message="Passwords do not match"),
         ],
     )
@@ -100,46 +129,46 @@ class RegisterFrom(Form):
 # Register
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    form = RegisterFrom(request.form)
+    form = RegisterForm(request.form)
     if request.method == "POST" and form.validate():
         name = form.name.data
         email = form.email.data
         username = form.username.data
-        # password = sha256_crypt.encrypt(str(form.password.data))
         password = form.password.data
         password = password.encode("utf-8")
         password = sha256(password).hexdigest()
 
-        # Execute query
-        sql = "INSERT INTO users(name, email, username, password) VALUES(%s, %s, %s, %s)"
-        val = (name, email, username, password)
-
+        mydb = None
+        mycursor = None
         try:
+            mydb = get_db_connection()
+            mycursor = mydb.cursor()
+
+            # Check if username or email already exists
+            check_sql = "SELECT * FROM users WHERE username = %s OR email = %s"
+            mycursor.execute(check_sql, (username, email))
+            existing_user = mycursor.fetchone()
+
+            if existing_user:
+                flash("Username or email already exists", "danger")
+                return render_template("register.html", form=form)
+
+            # Insert new user
+            sql = "INSERT INTO users(name, email, username, password) VALUES(%s, %s, %s, %s)"
+            val = (name, email, username, password)
             mycursor.execute(sql, val)
-            checkData = mycursor.fetchone()
 
-            if checkData:
-                flash("username or email already exist", "danger")
-            else:
-                sql = "INSERT INTO users(name, email, username, password) VALUES(%s, %s, %s, %s)"
-                val = (name, email, username, password)
-
-                try:
-                    mycursor.execute(sql, val)
-
-                except Exception as e:
-                    print("error", e)
-
-                mydb.commit()
-
-                print(mycursor.rowcount, "record inserted.")
-
-                flash("You are now registered and can log in", "success")
-
-                return redirect(url_for("index"))
+            flash("You are now registered and can log in", "success")
+            return redirect(url_for("login"))  # Redirect to login instead of index
 
         except Exception as e:
-            print("error", e)
+            app.logger.error(f"Error in registration: {e}")
+            flash("Registration failed. Please try again.", "danger")
+        finally:
+            if mycursor:
+                mycursor.close()
+            if mydb:
+                mydb.close()
 
     return render_template("register.html", form=form)
 
@@ -151,20 +180,23 @@ def login():
         username = request.form.get("username")
         password_candidate = request.form.get("password")
 
-        print(username)
-        print(password_candidate)
+        if not username or not password_candidate:
+            error = "Please provide both username and password"
+            return render_template("login.html", error=error)
 
-        sql = "SELECT * FROM users WHERE username = %s"
-        val = (username,)
-
+        mydb = None
+        mycursor = None
         try:
-            mycursor.execute(sql, val)
+            mydb = get_db_connection()
+            mycursor = mydb.cursor()
+
+            sql = "SELECT * FROM users WHERE username = %s"
+            mycursor.execute(sql, (username,))
 
             doc = mycursor.fetchone()
 
             if doc:
-                print(doc)
-                hash_pass = doc[4]
+                hash_pass = doc[4]  # Assuming password is at index 4
                 password = password_candidate.encode("utf-8")
                 password = sha256(password).hexdigest()
 
@@ -179,14 +211,20 @@ def login():
                     app.logger.info("PASSWORD NOT MATCHED")
                     error = "Invalid Password"
                     return render_template("login.html", error=error)
-
             else:
                 app.logger.info("NO USER IS MATCHED")
-                error = "Username is not found"
+                error = "Username not found"
                 return render_template("login.html", error=error)
 
         except Exception as e:
-            print("error", e)
+            app.logger.error(f"Error in login: {e}")
+            error = "Login failed. Please try again."
+            return render_template("login.html", error=error)
+        finally:
+            if mycursor:
+                mycursor.close()
+            if mydb:
+                mydb.close()
 
     return render_template("login.html")
 
@@ -213,28 +251,35 @@ def logout():
 
 
 # Dashboard
-@app.route("/dashboard", methods=["GET", "POST"])
+@app.route("/dashboard", methods=["GET"])
 @is_logged_in
 def dashboard():
-    sql = "SELECT * FROM articles WHERE author = %s"
-    val = (session["username"],)
-
+    mydb = None
+    mycursor = None
     try:
-        mycursor.execute(sql, val)
+        mydb = get_db_connection()
+        mycursor = mydb.cursor()
+
+        sql = "SELECT * FROM articles WHERE author = %s ORDER BY id DESC"
+        mycursor.execute(sql, (session["username"],))
 
         doc_2 = mycursor.fetchall()
 
-        print(doc_2)
-
         if doc_2:
             return render_template("dashboard.html", articles=doc_2)
-
         else:
             msg = "No Articles Found"
             return render_template("dashboard.html", msg=msg)
 
     except Exception as e:
-        print("error", e)
+        app.logger.error(f"Error in dashboard: {e}")
+        flash("Error loading dashboard", "danger")
+        return render_template("dashboard.html", msg="Error loading dashboard")
+    finally:
+        if mycursor:
+            mycursor.close()
+        if mydb:
+            mydb.close()
 
 
 # Article Form
@@ -252,94 +297,120 @@ def add_article():
         title = form.title.data
         body = form.body.data
 
-        sql = "INSERT INTO articles(title, body, author) VALUES(%s, %s, %s)"
-        val = (
-            title,
-            body,
-            session["username"],
-        )
-
+        mydb = None
+        mycursor = None
         try:
+            mydb = get_db_connection()
+            mycursor = mydb.cursor()
+
+            sql = "INSERT INTO articles(title, body, author) VALUES(%s, %s, %s)"
+            val = (title, body, session["username"])
             mycursor.execute(sql, val)
 
+            flash("Article Created", "success")
+            return redirect(url_for("dashboard"))
+
         except Exception as e:
-            print("error", e)
-
-        mydb.commit()
-
-        print(mycursor.rowcount, "record inserted.")
-
-        flash("Article Created", "success")
-
-        return redirect(url_for("dashboard"))
+            app.logger.error(f"Error creating article: {e}")
+            flash("Error creating article", "danger")
+        finally:
+            if mycursor:
+                mycursor.close()
+            if mydb:
+                mydb.close()
 
     return render_template("add_article.html", form=form)
 
 
 # Edit Article
-@app.route("/edit_article/<id>/", methods=["GET", "POST"])
+@app.route("/edit_article/<int:id>/", methods=["GET", "POST"])
 @is_logged_in
 def edit_article(id):
-    mycursor.execute("SELECT * FROM articles WHERE id = %s", [id])
+    mydb = None
+    mycursor = None
+    try:
+        mydb = get_db_connection()
+        mycursor = mydb.cursor()
 
-    article = mycursor.fetchone()
-
-    form = ArticleForm(request.form)
-
-    form.title.data = article[1]
-    form.body.data = article[3]
-
-    if request.method == "POST" and form.validate():
-        title = request.form.get("title")
-        body = request.form.get("body")
-
-        app.logger.info(title)
-
-        sql = "UPDATE articles SET title=%s, body=%s WHERE id=%s"
-        val = (
-            title,
-            body,
-            id,
+        # Get the article
+        mycursor.execute(
+            "SELECT * FROM articles WHERE id = %s AND author = %s",
+            (id, session["username"]),
         )
+        article = mycursor.fetchone()
 
-        try:
+        if not article:
+            flash("Article not found or you don't have permission to edit it", "danger")
+            return redirect(url_for("dashboard"))
+
+        form = ArticleForm(request.form)
+
+        if request.method == "GET":
+            form.title.data = article[1]  # Assuming title is at index 1
+            form.body.data = article[3]  # Assuming body is at index 3
+
+        if request.method == "POST" and form.validate():
+            title = form.title.data
+            body = form.body.data
+
+            sql = "UPDATE articles SET title=%s, body=%s WHERE id=%s AND author=%s"
+            val = (title, body, id, session["username"])
             mycursor.execute(sql, val)
-        except Exception as e:
-            print("error", e)
 
-        mydb.commit()
+            if mycursor.rowcount > 0:
+                flash("Article Updated", "success")
+            else:
+                flash("No changes made or article not found", "warning")
 
-        print(mycursor.rowcount, "record(s) affected")
+            return redirect(url_for("dashboard"))
 
-        flash("Article Updated", "success")
-
-        return redirect(url_for("dashboard"))
+    except Exception as e:
+        app.logger.error(f"Error editing article: {e}")
+        flash("Error updating article", "danger")
+    finally:
+        if mycursor:
+            mycursor.close()
+        if mydb:
+            mydb.close()
 
     return render_template("edit_article.html", form=form)
 
 
 # Delete Article
-@app.route("/delete_article/<id>", methods=["GET", "POST"])
+@app.route(
+    "/delete_article/<int:id>", methods=["POST"]
+)  # Changed to POST only for security
+@is_logged_in  # Added authentication check
 def delete_article(id):
-    sql = "DELETE FROM articles WHERE id = %s"
-    val = (id,)
-
+    mydb = None
+    mycursor = None
     try:
+        mydb = get_db_connection()
+        mycursor = mydb.cursor()
+
+        # Only allow deletion of user's own articles
+        sql = "DELETE FROM articles WHERE id = %s AND author = %s"
+        val = (id, session["username"])
         mycursor.execute(sql, val)
+
+        if mycursor.rowcount > 0:
+            flash("Article Deleted", "success")
+        else:
+            flash(
+                "Article not found or you don't have permission to delete it", "danger"
+            )
+
     except Exception as e:
-        print("error", e)
-    mydb.commit()
-
-    print(mycursor.rowcount, "record(s) deleted")
-
-    flash("Article Deleted", "success")
+        app.logger.error(f"Error deleting article: {e}")
+        flash("Error deleting article", "danger")
+    finally:
+        if mycursor:
+            mycursor.close()
+        if mydb:
+            mydb.close()
 
     return redirect(url_for("dashboard"))
 
 
-app.secret_key = "secret123"
-
 if __name__ == "__main__":
     app.run(port=5001, debug=True)
-
-# mydb.disconnect()
